@@ -1,0 +1,6 @@
+.tmp
+dev
+dist
+
+test.sh
+deploy.sh

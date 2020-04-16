@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+
+# This file is part of the fast-hdr project (https://git.sofusrose.com/so-rose/fast-hdr).
+# Copyright (c) 2020 Sofus Rose.
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#############
+## - Imports
+#############
+import os, sys
+import os.path
+import subprocess
+
+import datetime
+
+import curses
+
+
+
+#############
+## - Script Settings
+#############
+
+try :
+	if os.environ['TEST'] == 'true' :
+		TEST = True
+	else :
+		TEST = False
+except :
+	TEST = False
+
+SCRIPT_PATH = os.path.dirname( os.path.realpath(__file__) )
+
+MAX_WIDTH = 1920
+MAX_HEIGHT = 1080
+
+# Set Paths based
+log_path = f'{SCRIPT_PATH}/hdr_sdr.log'
+
+ffmpeg = f'{SCRIPT_PATH}/ffmpeg-custom'
+hdr_sdr = f'{SCRIPT_PATH}/hdr_sdr'
+lut_path = f'{SCRIPT_PATH}/cnv.lut8'
+
+# Assemble Basic Output Command
+cmd_raw = [ffmpeg] + sys.argv[1:]
+
+
+
+#############
+## - Utility Functions
+#############
+def runCommand(*command, workingDir=os.getcwd(), env=None, stream=False) :
+	print(
+		f"[COMMAND] {datetime.datetime.now()}",
+		f"\tCommand: {' '.join(command)}",
+		'\n',
+		
+		file = open(log_path, 'a'),
+		sep = '\n'
+	)
+	
+	# Ensure all is printed that needs to be printed.
+	sys.stdout.flush()
+	
+	# Change Directory to the working dir.
+	cache_curdir = os.getcwd()
+	
+	if stream :
+		os.chdir(workingDir)
+		
+		proc = subprocess.Popen(' '.join(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True, env=env)
+		proc_out = iter(lambda: proc.stdout.read(1), b'')
+		
+		while proc.poll() == None :
+			print( next(proc_out).decode('utf-8'), end='' )
+		
+	else :
+		os.chdir(workingDir)
+		
+		result = subprocess.run(' '.join(command), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True, env=env)
+		
+		os.chdir(cache_curdir)
+		
+		# Check the return code. Print the command output & exit if it's non-zero
+		if result.returncode != 0 :
+			print(result.stdout.decode('utf-8'))
+			print(
+				'[ERR]',
+				'Command Failed with message:\n',
+				*['>>\t' + x + '\n' for x in result.stdout.decode('utf-8').split('\n')],
+				file = open(log_path, 'a')
+			)
+			sys.exit()
+		
+		return result.stdout.decode('utf-8')
+
+
+
+#############
+## - Metadata Mining
+#############
+
+# Extract File Paths
+file_src = next(snip[5:] for snip in cmd_raw if snip[:5] == 'file:')
+hls_dst = next(cmd_raw[i+1] for (i, snip) in enumerate(cmd_raw) if snip == '-hls_segment_filename')
+file_dst = cmd_raw[-1]
+
+# Extract Audio Stream #
+audio_stream_num = 1
+for mapping in [cmd_raw[i+1] for (i, snip) in enumerate(cmd_raw) if snip == '-map'] :
+	if mapping[-1] not in ('0', 's') :
+		# The Audio Stream #!
+		audio_stream_num = int(mapping[2])
+
+# Extract Input Format
+inp_format = next(cmd_raw[i+1] for (i, snip) in enumerate(cmd_raw) if snip[:2] == '-f')
+
+# Extract Seek Information (may not exist))
+try :
+	seek_time = next(cmd_raw[i+1] for (i, snip) in enumerate(cmd_raw) if snip[:3] == '-ss')
+except :
+	seek_time = "00:00:00"
+
+# Extract Resolution
+x_res = int(
+	runCommand(
+		'mediainfo',
+		'--Language=raw',
+		'--Inform="Video;%Width%"',
+		f'"{file_src}"',
+	)
+)
+
+y_res = int(
+	runCommand(
+		'mediainfo',
+		'--Language=raw',
+		'--Inform="Video;%Height%"',
+		f'"{file_src}"',
+	)
+)
+
+# Limit Resolution to 1920 Horizontal
+if x_res > MAX_WIDTH :
+	fac = x_res / MAX_WIDTH
+	
+	x_res /= fac
+	y_res /= fac
+
+elif y_res > MAX_HEIGHT :
+	fac = y_res / MAX_HEIGHT
+	
+	x_res /= fac
+	y_res /= fac
+
+# Extract Color Information
+primaries = runCommand(
+	'mediainfo',
+	'--Language=raw',
+	'--Inform="Video;%colour_primaries%"',
+	f'"{file_src}"',
+).strip()
+
+# Extract FPS Information
+fps = round(float(
+	runCommand(
+		'mediainfo',
+		'--Language=raw',
+		'--Inform="Video;%FrameRate%"',
+		f'"{file_src}"',
+	).strip()
+))
+
+
+
+#############
+## - Reconstruct Command
+#############
+
+# Inset Quotes Where Quotes Are Needed
+after_map_ind = None
+for i, snip in enumerate(cmd_raw) :
+	# Record When Mapping Ends
+	if snip[:8] == '-codec:v' :
+		after_map_ind = i
+	
+	# Quote File Paths
+	if snip[:5] == 'file:' :
+		cmd_raw[i] = snip[:5] + '"' + snip[5:] + '"'
+	
+	# Quote Expressions
+	if snip[:5] == 'expr:' :
+		cmd_raw[i] = '"' + snip + '"'
+	
+	# Quote Video Filters
+	if snip[:3] == '-vf' :
+		cmd_raw[i+1] = '"' + cmd_raw[i+1] + '"'
+	
+	# Quote Audio Filters
+	if snip[:3] == '-af' :
+		cmd_raw[i+1] = '"' + cmd_raw[i+1] + '"'
+	
+	# Quote HLS Segment Filename
+	if i == len(cmd_raw)-1 :
+		cmd_raw[i] = '"' + cmd_raw[i] + '"'
+	
+	# Quote HLS Segment Filename
+	if snip[:21] == '-hls_segment_filename' :
+		cmd_raw[i+1] = '"' + cmd_raw[i+1] + '"'
+
+print(
+	f"[CALLED]  {datetime.datetime.now()}",
+	f"\tCommand: {' '.join([os.path.realpath(__file__)] + cmd_raw[1:])}",
+	'\n',
+	
+	file = open(log_path, 'a'),
+	sep = '\n'
+)
+
+
+#############
+## - Construct New Command
+#############
+
+if TEST :
+	test_write = [
+		# Video Encoding
+		'-c:v'      , 'libx264',
+		'-pix_fmt'  , 'yuv420p',
+		'-preset'   , 'veryfast',
+		'-crf'      , '23',
+		'-maxrate' , '34541128',
+		'-bufsize'  , '69082256',
+		'-level'    , '4.1',
+		'-profile:v', 'high',
+		
+		# Audio Encoding
+		'-c:a', 'aac',
+		
+		# Output
+		'-f'    , 'avi',
+		'pipe:1',
+		
+		# PIPE
+		'|',
+		
+		# Playback
+		'ffplay',
+		'-hide_banner',
+		'-loglevel panic',
+		'pipe:0'
+	]
+
+if primaries == "BT.2020" :
+	# HDR Processing Path
+	
+	# Build New Command
+	cmd_read = [
+		# Base
+		ffmpeg,
+		'-hide_banner',
+		# ~ '-loglevel panic',
+		
+		# Input #0
+		'-ss'     , seek_time,
+		'-f'      , inp_format,
+		'-i'      , f'file:"{file_src}"',
+		
+		# Processing
+		'-threads', '0',
+		'-s'      , f'{x_res:.0f}x{y_res:.0f}',
+		
+		# Encoding
+		'-c:v'    , 'rawvideo',
+		'-pix_fmt', 'yuv444p',
+		'-an',
+		
+		# Output
+		'-f'      , 'rawvideo',
+		'pipe:1',
+	]
+	
+	cmd_proc = [
+		hdr_sdr,
+		f'{x_res}',
+		f'{y_res}',
+		f'{lut_path}',
+	]
+	
+	cmd_write = [
+		# Base
+		ffmpeg,
+		'-hide_banner',
+		# ~ '-loglevel panic',
+		
+		# Input #0
+		'-s'      , f'{x_res:.0f}x{y_res:.0f}',
+		'-pix_fmt', 'yuv444p',
+		'-f'      , 'rawvideo',
+		'-r'      , f'{fps}',
+		'-i'      , 'pipe:0',
+		
+		'-itsoffset 00:00:00.0',
+		
+		# Input #1
+		'-ss'     , seek_time,
+		'-f'      , inp_format,
+		'-i'      , f'file:"{file_src}"',
+		
+		# Mapping (all but video from 0)
+		'-map_metadata', '-1',
+		'-map_chapters', '-1',
+		
+		'-threads', '0',
+		
+		'-map', '0:v',
+		'-map', f'1:{audio_stream_num:.0f}',
+		'-map', '-1:s',
+	]
+	
+	if TEST :
+		cmd_write += test_write
+	else :
+		# Allow the Rest of cmd_raw to remain untouched
+		cmd_write += cmd_raw[after_map_ind:]
+		
+		# ~ cmd_write += [
+			# ~ # Video Encoding
+			# ~ '-codec:v:0', 'libx264',
+			# ~ '-pix_fmt'  , 'yuv420p',
+			# ~ '-preset'   , 'veryfast',
+			# ~ '-crf'      , '23',
+			# ~ '-maxrate'  , '9229044',
+			# ~ '-bufsize'  , '18458088',
+			# ~ '-profile:v', 'high',
+			# ~ '-level'    , '4.1',
+			# ~ '-x264opts:0', 'subme=0:me_range=4:rc_lookahead=10:me=dia:no_chroma_me:8x8dct=0:partitions=none',
+			
+			# ~ '-force_key_frames:0',
+			# ~ '"expr:gte(t,0+n_forced*3)"',
+			
+			# ~ '-g', '72',
+			# ~ '-keyint_min', '72',
+			# ~ '-sc_threshold', '0',
+			
+			# ~ '-vf', '"scale=trunc(min(max(iw\,ih*dar)\,1920)/2)*2:trunc(ow/dar/2)*2"',
+			
+			
+			# ~ # Audio Encoding
+			# ~ '-codec:a:0', 'aac',
+			# ~ '-strict', 'experimental',
+			# ~ '-ac', '2',
+			# ~ '-ab', '384000',
+			# ~ '-af', '"volume=2"',
+			
+			
+			# ~ # Timestamp
+			# ~ '-copyts',
+			# ~ '-avoid_negative_ts', 'disabled',
+			
+			# ~ '-start_at_zero',
+			# ~ '-vsync', '-1',
+			
+			# ~ # HLS Options
+			# ~ '-f', 'hls',
+			# ~ '-max_delay', '5000000',
+			# ~ '-hls_time', '3',
+			# ~ '-individual_header_trailer', '0',
+			# ~ '-hls_segment_type', 'mpegts',
+			# ~ '-start_number', '0',
+			# ~ '-hls_segment_filename', f'"{hls_dst}"',
+			# ~ '-hls_playlist_type', 'vod',
+			# ~ '-hls_list_size', '0',
+			
+			# ~ # Output
+			# ~ '-y',
+			# ~ f'"{file_dst}"'
+		# ~ ]
+	
+	cmd = cmd_read + ['|'] + cmd_proc + ['|'] + cmd_write
+	# ~ cmd = cmd_read + ['|'] + cmd_write
+	# ~ cmd = cmd_raw
+else :
+	# SDR Processing Path- DO NOTHING!
+	if TEST :
+		cmd = cmd_raw[:after_map_ind] + test_write
+	else :
+		cmd = cmd_raw
+
+print(
+	f"[INVOKE]  {datetime.datetime.now()}",
+	f"\tFile: {file_src}",
+	f"\tPrimaries: {primaries}",
+	f"\tTime: {seek_time}",
+	f"\tRes: {x_res:.0f}x{y_res:.0f}",
+	'\n',
+	
+	file = open(log_path, 'a'),
+	sep = '\n'
+)
+
+# Run Command
+runCommand(*cmd, stream = True)
